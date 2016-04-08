@@ -28,6 +28,8 @@
 #define RX_QUEUE_SZ 256			// The size of rx queue. Max is 4096 and is the one you'll have best performances with. Use lower if you want to use Burst Bulk Alloc.
 #define TX_QUEUE_SZ 4096			// Unused, you don't tx packets
 
+#define AX_RX_BURST_SIZE 32
+
 /* Global vars */
 char * file_name = NULL;
 pcap_t *pt;
@@ -48,6 +50,7 @@ uint64_t num_pkt_good_sent = 0;
 uint64_t num_bytes_good_sent = 0;
 uint64_t old_num_pkt_good_sent = 0;
 uint64_t old_num_bytes_good_sent = 0;
+uint64_t num_drop = 0;
 
 struct timeval start_time;
 struct timeval last_time;
@@ -103,83 +106,197 @@ int main(int argc, char **argv)
 
 	/* Start consumer and producer routine on 2 different cores: producer launched first... */
 	ret =  rte_eal_mp_remote_launch (main_loop_producer, NULL, SKIP_MASTER);
-	if (ret != 0) FATAL_ERROR("Cannot start consumer thread\n");	
+	if (ret != 0) FATAL_ERROR("Cannot start producer thread\n");	
 
 	/* ... and then loop in consumer */
-	main_loop_consumer ( NULL );	
+	main_loop_consumer ( 0 );	
 
 	return 0;
+}
+
+struct pcap_buff_t {
+    struct pcap_pkthdr pkt_hdr;
+    unsigned char *pkt_data;
+    uint32_t pkt_id;
+};
+
+// 保存所有pcap_buff_t
+struct pcap_buff_pkts {
+    uint32_t howmany;
+    struct pcap_buff_t *pkts;
+};
+
+// 计算多少个报文
+static int count_pcap_file(char *fn) {
+    int status;
+    int howmany = 0;
+    pcap_t *cap_file = NULL;
+    char errbuf[PCAP_ERRBUF_SIZE] = {0};
+
+    const unsigned char *pkt_data = NULL;
+    struct pcap_pkthdr *pkt_hdr = NULL;
+
+    cap_file = pcap_open_offline(fn, errbuf);
+    if (!cap_file) {
+        printf("read pcapfile failed: %s\n", errbuf);
+        return -1;
+    }
+
+    status = pcap_next_ex(cap_file, &pkt_hdr, &pkt_data);
+    while (status == 1) {
+        howmany ++;
+        status = pcap_next_ex(cap_file, &pkt_hdr, &pkt_data);
+    }
+    pcap_close(cap_file);
+    return howmany;
+}
+
+// 读pcap file
+static int read_pcap_file(char *fn, struct pcap_buff_pkts *pkts) {
+    int i, status;
+    int howmany;
+    pcap_t *cap_file = NULL;
+    char errbuf[PCAP_ERRBUF_SIZE] = {0};
+    struct pcap_pkthdr *pkt_hdr = NULL;
+    const unsigned char *pkt_data = NULL;
+
+    struct pcap_buff_t *pkt;
+
+    howmany = count_pcap_file(fn);
+    pkts->howmany = howmany;
+
+    if (howmany <= 0)
+        return -1;
+
+    pkts->pkts = (struct pcap_buff_t *)rte_malloc("pkts array", sizeof(struct pcap_buff_t) * howmany, 64);
+    if (!pkts->pkts) {
+        return -2;
+    }
+
+    cap_file = pcap_open_offline(fn, errbuf);
+    if (!cap_file) {
+        printf("read pcapfile failed: %s\n", errbuf);
+        rte_free(pkts->pkts);
+        return -3;
+    }
+
+    i = 0;
+    pkt = &pkts->pkts[i];
+    status = pcap_next_ex(cap_file, &pkt_hdr, &pkt_data);
+    while (status == 1) {
+        pkt->pkt_data = (unsigned char *)rte_malloc("pcap pkt", pkt_hdr->caplen, 64);
+        if (pkt->pkt_data == NULL) {
+            goto failed;
+        }
+        rte_memcpy(&pkt->pkt_hdr, pkt_hdr, sizeof(*pkt_hdr));
+        rte_memcpy(pkt->pkt_data, pkt_data, pkt_hdr->caplen);
+        pkt->pkt_id = (uint32_t)i;
+
+        i ++;
+        pkt = &pkts->pkts[i];
+        status = pcap_next_ex(cap_file, &pkt_hdr, &pkt_data);
+    }
+    pcap_close(cap_file);
+
+    return 0;
+
+failed:
+    pcap_close(cap_file);
+    for(; i > 0; i -- ) {
+        pkt = &pkts->pkts[i-1];
+        rte_free(pkt->pkt_data);
+    }
+    rte_free(pkts->pkts);
+    return -1;
 }
 
 static int main_loop_producer(__attribute__((unused)) void * arg){
 
 	struct rte_mbuf * m;
-	char ebuf[256];
-	struct pcap_pkthdr *h;
-	void * pkt;
+	//char ebuf[256];
+	//struct pcap_pkthdr *h;
+	//void * pkt;
 	uint64_t time, interval, end_time;
 	int ret;
+
+    struct pcap_buff_pkts pkts;
+    struct pcap_buff_t *pkt;
+
+    struct rte_mbuf *pkts_burst[AX_RX_BURST_SIZE];
+    uint16_t nb_objs;
+    uint32_t i, pkt_id = 0;
 
 	/* Open the trace */
 	printf("Opening file: %s\n", file_name);
 	printf("Replay on %d interface(s)\n", nb_sys_ports);
 	printf("Each packet replayed %d time(s) on each interface\n", times);
-	pt = pcap_open_offline(file_name, ebuf);
-	if (pt == NULL){	
-		printf("Unable to open file: %s\n", file_name);
-		exit(1);			
-	}	
+
+	ret = read_pcap_file(file_name, &pkts);
+    if (ret < 0) {
+        printf( "read pcapfile %s failed: ret=%d\n", file_name, ret);
+        exit(1);
+    }
+    printf("read %d packets from pcapfile.\n", pkts.howmany);
 
 	/* Infinite loop */
 	for (;;) {
 
 		/* Read packet from trace */
+		nb_objs = 0;
 		time = rte_get_tsc_cycles();
-		ret = pcap_next_ex(pt, &h, (const u_char**)&pkt);
-		end_time = rte_get_tsc_cycles();
-		if(ret <= 0) {
-			if (ret==-2)
-				printf("All the file replayed...\n");
-			if (ret==-1)
-				printf("Error in pcap: %s\n", pcap_geterr(pt));
-			break;
+		for (i = 0; i < AX_RX_BURST_SIZE; i ++, pkt_id ++, nb_objs ++) {
+			if (pkt_id >= pkts.howmany) {
+				pkt_id = 0;
+				break;
+			}
+			pkt = &pkts.pkts[pkt_id];
+
+			while( (pkts_burst[i] = rte_pktmbuf_alloc(pktmbuf_pool)) == NULL) {};
+
+
+			m = pkts_burst[i];
+			m->data_len = m->pkt_len = pkt->pkt_hdr.caplen;
+			rte_memcpy ( (char*) m->buf_addr + m->data_off, pkt, m->data_len);
 		}
 
-		/* Alloc the buffer */
-
-		while( (m =  rte_pktmbuf_alloc 	(pktmbuf_pool)) == NULL) {}
+		end_time = rte_get_tsc_cycles();
 
 		interval = end_time-time;
-		avg = avg + interval;
-		nb++;
+		avg = avg + interval / nb_objs;
+		nb+=nb_objs;
 		if(interval > max)
 			max = interval;
-
 
 		/* Not fill the buffer */
 		while (rte_mempool_free_count (pktmbuf_pool) > buffer_size*BUFFER_RATIO ) {}
 
-		/* Compile the buffer */
-		m->data_len = m->pkt_len = h->caplen;
-		rte_memcpy ( (char*) m->buf_addr + m->data_off, pkt, h->caplen);
-
 		/* Enqueue it */
-		ret = rte_ring_enqueue (intermediate_ring, m);
-
+		ret = rte_ring_sp_enqueue_burst (intermediate_ring, (void *)pkts_burst, nb_objs);
+		if (unlikely(ret < nb_objs) ) {
+			printf("expect enqueue %d packets, but enqueue %d.\n", nb_objs, ret);
+			do {
+				rte_pktmbuf_free(pkts_burst[ret]);
+			} while(++ret < nb_objs);
+		}
 	}
 
 	sig_handler (SIGINT);
 }
 
 /* Loop function, batch timing implemented */
-static int main_loop_consumer(__attribute__((unused)) void * arg){
+static int main_loop_consumer(void * arg){
 	struct rte_mbuf * m, * m_copy;
 	struct timeval now;
-	struct ipv4_hdr * ip_h;
+	//struct ipv4_hdr * ip_h;
 	double mult_start = 0, mult = 0, real_rate, deltaMillisec;
 	int i, ix, ret, length;
 	uint64_t tick_start;
 
+    struct rte_mbuf *pkts_burst[AX_RX_BURST_SIZE];
+    //uint16_t nb_objs;
+	uint16_t nb_tx;
+	uint16_t nb_pkt;
+	uint8_t  port_id = (uint8_t)(unsigned long)arg;
 
 	/* Prepare variables to rate setting if needed */
 	if(rate != 0){
@@ -194,79 +311,54 @@ static int main_loop_consumer(__attribute__((unused)) void * arg){
 	last_time = start_time;
 	tick_start =   rte_get_tsc_cycles();
 
+	(void)tick_start;
+	(void)ix;
+	(void)deltaMillisec;
+	(void)real_rate;
+	(void)mult;
+	(void)m_copy;
+	(void)m;
+
 	/* Start stats */
    	alarm(1);
-	for (i=0;i<nb_sys_ports; i++)
-		rte_eth_stats_reset ( i );
+	rte_eth_stats_reset ( port_id );
 
 	/* Infinite loop */
 	for (;;) {
 
 		/* Dequeue packet */
-		ret = rte_ring_dequeue(intermediate_ring, (void**)&m);
-		
+		nb_pkt = rte_ring_dequeue_burst(intermediate_ring, (void *)pkts_burst, AX_RX_BURST_SIZE);
+
 		/* Continue polling if no packet available */
-		if( unlikely (ret != 0)) continue;
-	
-		length = m->data_len;
+		if( unlikely (nb_pkt == 0)) continue;
+		length = 0;
+		for (i = 0; i < nb_pkt; i ++)
+			length += pkts_burst[i]->data_len + 24;
 
-		/* For each received packet. */
-		for (i = 0; likely( i < nb_sys_ports * times ) ; i++) {
-
-			/* Add a number to ip address if needed */
-			ip_h = (struct ipv4_hdr*)((char*) m->buf_addr + m->data_off + sizeof(struct  ether_hdr));
-			if (sum_value > 0){
-				ip_h->src_addr+=sum_value*256*256*256;
-				ip_h->dst_addr+=sum_value*256*256*256;
-			}
-
-			/* The last time sends 'm', the other times it makes a copy */
-			if(i == nb_sys_ports * times-1){
-				/* Loop untill it is not sent */
-				while ( rte_eth_tx_burst (i / times, 0, &m, 1) != 1)
-					if (unlikely(do_shutdown)) break;
-			}
-			else{
-
-				/* Copy the packet from the previous when sending on multiple */
-				while( (m_copy = rte_pktmbuf_alloc (pktmbuf_pool)) == NULL) {}
-
-				/* Compile the buffer */
-				m_copy->data_len = m_copy->pkt_len = length;
-				rte_memcpy ( (char*) m_copy->buf_addr + m_copy->data_off, (char*) m->buf_addr + m->data_off, length);
-
-				/* Loop untill it is not sent */
-				while ( rte_eth_tx_burst (i / times, 0, &m_copy , 1) != 1)
-					if (unlikely(do_shutdown)) break;
-
-			}
-
-
+		nb_tx = 0;
+		while(nb_tx < nb_pkt) {
+			nb_tx += rte_eth_tx_burst(port_id, 0, &pkts_burst[nb_tx], nb_pkt-nb_tx);
 		}
+		/*
+		if (unlikely(nb_tx < nb_pkt)) {
+			printf("port %d tx_queue %d - drop "
+				       "(nb_pkt:%u - nb_tx:%u)=%u packets\n",
+				       port_id, 0,
+				       (unsigned) nb_pkt, (unsigned) nb_tx,
+				       (unsigned) (nb_pkt - nb_tx));
 
-		/* Rate set */
-		if(rate > 0) {
-			/* Adjust the rate every 100 packets sent */
-			if (ix++%1 ==0){
-				/* Calculate the actual rate */
-				ret = gettimeofday(&now, NULL);
-				if (ret != 0) FATAL_ERROR("Error: gettimeofday failed. Quitting...\n");
-
-				deltaMillisec = (double)(now.tv_sec - start_time.tv_sec ) * 1000 + (double)(now.tv_usec - start_time.tv_usec ) / 1000 ;
-				real_rate = (double)(num_bytes_good_sent * 1000)/deltaMillisec * 8/(1000*1000*1000);
-				mult = mult + (real_rate - rate); // CONTROL LAW;
-
-				/* Avoid negative numbers. Avoid problems when the NICs are stuck for a while */
-				if (mult < 0) mult = 0;
-			}
-			/* Wait to adjust the rate*/
-			while(( rte_get_tsc_cycles() - tick_start) < (num_bytes_good_sent * mult / rate )) 
-				if (unlikely(do_shutdown)) break;
+			num_drop += nb_pkt - nb_tx;
+			//fs->fwd_dropped += (nb_pkt - nb_tx);
+			do {
+				length -= pkts_burst[nb_tx]->data_len + 24;
+				rte_pktmbuf_free(pkts_burst[nb_tx]);
+			} while (++nb_tx < nb_pkt);
 		}
+		*/
 
 		/* Update stats */
-		num_pkt_good_sent+= times;
-		num_bytes_good_sent += (m->data_len + 24) * times; /* 8 Preamble + 4 CRC + 12 IFG*/
+		num_pkt_good_sent+= nb_tx;
+		num_bytes_good_sent += length; /* 8 Preamble + 4 CRC + 12 IFG*/
 
 		/* Check if time_out elapsed*/
 		if (time_out != 0){
@@ -275,15 +367,15 @@ static int main_loop_consumer(__attribute__((unused)) void * arg){
 
 			if (now.tv_sec-start_time.tv_sec >= time_out ){
 				printf("Timeout of %ld seconds elapsed...\n", time_out);
-				sig_handler(SIGINT);
+				break;
 			}
-				
+
 		}
 
 		/* Check if max_pkt have been sent */
 		if (max_pkt != 0 && num_pkt_good_sent >= max_pkt){
 			printf("Sent %ld packets...\n", max_pkt);
-			sig_handler(SIGINT);
+			break;
 		}
 
 	}
@@ -312,7 +404,8 @@ void print_stats (void){
 	mpps_tot = (double)(num_pkt_good_sent)/tot_ms/1000;
 
 	printf("Rate: %8.3fGbps  %8.3fMpps [Average rate: %8.3fGbps  %8.3fMpps], Buffer: %8.3f%% ", gbps_inst, mpps_inst, gbps_tot, mpps_tot, (double)rte_mempool_free_count (pktmbuf_pool)/buffer_size*100.0 );
-	printf("Packets read speed: %8.3fus\n", (double)avg/nb/rte_get_timer_hz()*1000000, max);
+	printf("Packets read speed: %8.3fus ", (double)avg/nb/rte_get_timer_hz()*1000000);
+	printf("dropped: %lu\n", num_drop);
 	avg = max = nb = 0;	
 
 	/* Update counters */
@@ -358,7 +451,7 @@ static void sig_handler(int signo)
 		print_stats();
 
 		/* Close the pcap file */
-		pcap_close(pt);
+		//pcap_close(pt);
 		exit(0);	
 	}
 }

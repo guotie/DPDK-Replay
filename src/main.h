@@ -59,6 +59,7 @@
 #include <rte_cycles.h>
 #include <rte_atomic.h>
 #include <rte_version.h>
+#include <rte_malloc.h>
 
 /* Useful macro for error handling */
 #define FATAL_ERROR(fmt, args...)       rte_exit(EXIT_FAILURE, fmt "\n", ##args)
